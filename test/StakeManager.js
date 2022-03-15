@@ -8,6 +8,7 @@ const {
   STAKE_MODIFIER_ROLE,
   WITHDRAW_LOCK_PERIOD,
   GOVERNER_ROLE,
+  GOVERNANCE_ROLE,
   PAUSE_ROLE,
   WITHDRAW_INITIATION_PERIOD,
 } = require('./helpers/constants');
@@ -266,9 +267,15 @@ describe('StakeManager', function () {
       assertBNEqual(await sToken.balanceOf(staker._address), prevBalance.add(sAmount), 'Amount of minted sRzR is not correct');
     });
 
-    it('Staker should not be able to withdraw if didnt unstake', async function () {
+    it('Staker should not be able to initiate withdraw if didnt unstake', async function () {
       const stakerId = await stakeManager.stakerIds(signers[1].address);
       const tx = stakeManager.connect(signers[1]).initiateWithdraw(stakerId);
+      await assertRevert(tx, 'Did not unstake');
+    });
+
+    it('Staker should not be able to unlock withdraw if didnt unstake', async function () {
+      const stakerId = await stakeManager.stakerIds(signers[1].address);
+      const tx = stakeManager.connect(signers[1]).unlockWithdraw(stakerId);
       await assertRevert(tx, 'Did not unstake');
     });
 
@@ -429,7 +436,7 @@ describe('StakeManager', function () {
       await mineToNextEpoch();
       epoch = await getEpoch();
       let secret = '0x727d5c9e6d18ed45ce7ac8d3cce6ec8a0e9c02581415c0823ea49d847ccb9cdd';
-      await commit(signers[2], 0, voteManager, collectionManager, secret);
+      await commit(signers[2], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[2], 0, voteManager, stakeManager, collectionManager);
@@ -452,7 +459,7 @@ describe('StakeManager', function () {
 
       epoch = await getEpoch();
       secret = '0x727d5c9e6d18ed45ce7ac8d3cce6ec8a0e9c02481415c0823ea49d847ccb9cdd';
-      await commit(signers[2], 0, voteManager, collectionManager, secret);
+      await commit(signers[2], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[2], 0, voteManager, stakeManager, collectionManager);
@@ -483,7 +490,7 @@ describe('StakeManager', function () {
       // commit
       epoch = await getEpoch();
       const secret = '0x727d5c9e6d18ed45ce7ac8d3cee6ec8a0e9c02481415c0823ea49d847ccb9cdd';
-      await commit(signers[3], 0, voteManager, collectionManager, secret);
+      await commit(signers[3], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[3], 0, voteManager, stakeManager, collectionManager);
@@ -508,7 +515,7 @@ describe('StakeManager', function () {
 
       // commit
       const secret = '0x727d5c9e6d18ed45ce7ac8d3cee6ec8a1e9c02481415c0823ea49d847ccb9cdd';
-      await commit(signers[3], 0, voteManager, collectionManager, secret);
+      await commit(signers[3], 0, voteManager, collectionManager, secret, blockManager);
       await mineToNextState(); // reveal
       // Staker is not penalised because no. of inactive epochs (8) <= max allowed inactive epochs i.e grace_period (8)
       await reveal(signers[3], 0, voteManager, stakeManager, collectionManager);
@@ -543,7 +550,7 @@ describe('StakeManager', function () {
       const newStake = staker.stake;
       // commit in epoch 42 , outside grace_period
       const secret = '0x727d5c9e6d18ed45ce7ac7d3cee6ec0a1e9c01481415c0823ea49d847ccb9cdd';
-      await commit(signers[3], 0, voteManager, collectionManager, secret);
+      await commit(signers[3], 0, voteManager, collectionManager, secret, blockManager);
       staker = await stakeManager.getStaker(3);
       // Total no of inactive epochs = 42 - 32 - 1 = 9
       // Staker 3 is penalised because total inactive epochs(9) > max allowed inactive epochs i.e grace_period (8)
@@ -592,6 +599,16 @@ describe('StakeManager', function () {
       await assertRevert(tx, 'Commission exceeds maxlimit');
     });
 
+    it('stakeManager setter functions should revert as expected', async function () {
+      await stakeManager.grantRole(GOVERNANCE_ROLE, signers[1].address);
+      let tx = stakeManager.connect(signers[1]).setMinSafeRazor(tokenAmount('200000'));
+      await assertRevert(tx, 'minSafeRazor beyond minStake');
+      tx = stakeManager.connect(signers[1]).setMaxCommission(101);
+      await assertRevert(tx, 'Invalid Max Commission Update');
+      tx = stakeManager.connect(signers[1]).setSlashParams(toBigNumber('500000'), toBigNumber('9500000'), toBigNumber('500000'));
+      await assertRevert(tx, 'params sum exceeds denominator');
+    });
+
     it('Staker should not be able to updateCommission if it exceeds the change limit which is delta commission', async function () {
       const deltaCommission = 3;
       await stakeManager.connect(signers[1]).updateCommission(4);
@@ -624,7 +641,7 @@ describe('StakeManager', function () {
       const staker = await stakeManager.getStaker(4);
       // Participation In Epoch as delegators cant delegate to a staker untill they participate
       const secret = '0x727d5c9e6d18ed35ce7ac8d3cee6ec8a1e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[4], 0, voteManager, collectionManager, secret);
+      await commit(signers[4], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[4], 0, voteManager, stakeManager, collectionManager);
@@ -669,9 +686,15 @@ describe('StakeManager', function () {
       await stakeManager.connect(signers[0]).unpause();
     });
 
-    it('Delegator should not be able to withdraw if didnt unstake', async function () {
+    it('Delegator should not be able to initiate withdraw if didnt unstake', async function () {
       const stakerId = await stakeManager.stakerIds(signers[1].address);
       const tx = stakeManager.connect(signers[5]).initiateWithdraw(stakerId);
+      await assertRevert(tx, 'Did not unstake');
+    });
+
+    it('Staker should not be able to unlock withdraw if didnt unstake', async function () {
+      const stakerId = await stakeManager.stakerIds(signers[1].address);
+      const tx = stakeManager.connect(signers[5]).unlockWithdraw(stakerId);
       await assertRevert(tx, 'Did not unstake');
     });
 
@@ -766,7 +789,7 @@ describe('StakeManager', function () {
         // commit
         epoch = await getEpoch();
         const secret = '0x727d5c5e5d18ed35ce7ac8d3cee6ec8a1e9c02481415c0823ea49d847ccb9eee';
-        await commit(signers[4], 0, voteManager, collectionManager, secret);
+        await commit(signers[4], 0, voteManager, collectionManager, secret, blockManager);
 
         await mineToNextState(); // reveal
         await reveal(signers[4], 0, voteManager, stakeManager, collectionManager);
@@ -859,7 +882,7 @@ describe('StakeManager', function () {
         // commit
         let epoch = await getEpoch();
         const secret = '0x727d5c9e6d18ed45ce7ac8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-        await commit(signers[4], 0, voteManager, collectionManager, secret);
+        await commit(signers[4], 0, voteManager, collectionManager, secret, blockManager);
 
         await mineToNextState(); // reveal
         await reveal(signers[4], 0, voteManager, stakeManager, collectionManager);
@@ -1210,7 +1233,7 @@ describe('StakeManager', function () {
 
       // Participation In Epoch as delegators cant delegate to a staker untill they participate
       const secret = '0x427d5c9e6d18ed45ce7ac8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[9], 0, voteManager, collectionManager, secret);
+      await commit(signers[9], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[9], 0, voteManager, stakeManager, collectionManager);
@@ -1245,7 +1268,7 @@ describe('StakeManager', function () {
       // Participation In Epoch
       epoch = await getEpoch();
       const secret = '0x427d5c9e6d18ed45ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[9], 0, voteManager, collectionManager, secret);
+      await commit(signers[9], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[9], 0, voteManager, stakeManager, collectionManager);
@@ -1297,7 +1320,7 @@ describe('StakeManager', function () {
       // commit
       // const votes1 = [100, 200, 300, 400, 500, 600, 700, 800, 900];
       const secret = '0x427d5c9e6d18ed45ce7aa8e3cce6ec8a0e9c02491415c0823ea49d847ccb9ddd';
-      await commit(signers[4], 0, voteManager, collectionManager, secret);
+      await commit(signers[4], 0, voteManager, collectionManager, secret, blockManager);
 
       staker = await stakeManager.getStaker(4);
       assertBNEqual(prevStake, staker.stake, 'Inactivity penalties have been levied');
@@ -1438,7 +1461,7 @@ describe('StakeManager', function () {
 
       const stakerIdAcc4 = await stakeManager.stakerIds(signers[4].address);
       const secret = '0x427d5c9e0d18ed45ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[4], 0, voteManager, collectionManager, secret);
+      await commit(signers[4], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[4], 0, voteManager, stakeManager, collectionManager);
@@ -1545,7 +1568,7 @@ describe('StakeManager', function () {
 
       // Participation In Epoch as delegators cant delegate to a staker untill they participate
       const secret = '0x427d5c9e0d18ed89ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[8], 0, voteManager, collectionManager, secret);
+      await commit(signers[8], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[8], 0, voteManager, stakeManager, collectionManager);
@@ -1599,7 +1622,7 @@ describe('StakeManager', function () {
 
       // Participation In Epoch as delegators cant delegate to a staker untill they participate
       const secret = '0x427e5c9e0d18ed89ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
-      await commit(signers[11], 0, voteManager, collectionManager, secret);
+      await commit(signers[11], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[11], 0, voteManager, stakeManager, collectionManager);
@@ -1677,7 +1700,7 @@ describe('StakeManager', function () {
       await stakeManager.connect(signers[17]).setDelegationAcceptance('true');
       let staker = await stakeManager.getStaker(stakerId);
       const secret = '0x427d5c9e0d18ed89ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9eed';
-      await commit(signers[17], 0, voteManager, collectionManager, secret);
+      await commit(signers[17], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[17], 0, voteManager, stakeManager, collectionManager);
@@ -1813,7 +1836,7 @@ describe('StakeManager', function () {
       await mineToNextEpoch();
       let epoch = await getEpoch();
       const secret = '0x427d5c9e0d18ed89ce7aa8e3cce6ec8a0e9c02481415c0823ea49d847ccb9dee';
-      await commit(signers[17], 0, voteManager, collectionManager, secret);
+      await commit(signers[17], 0, voteManager, collectionManager, secret, blockManager);
 
       await mineToNextState(); // reveal
       await reveal(signers[17], 0, voteManager, stakeManager, collectionManager);

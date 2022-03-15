@@ -44,10 +44,10 @@ library Structs {
     }
 
     struct Dispute {
-        uint16 medianIndex;
+        uint16 leafId;
+        uint32 median;
         uint32 lastVisitedValue;
         uint256 accWeight;
-        uint256 accProd;
     }
 
     struct Job {
@@ -71,7 +71,7 @@ library Structs {
     }
 
     struct AssignedAsset {
-        uint16 medianIndex;
+        uint16 leafId;
         uint32 value;
     }
 

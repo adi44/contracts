@@ -10,12 +10,13 @@ const { createMerkle, getProofPath } = require('./MerklePosAware');
 
 let store = {};
 let influenceSum = new Array(100).fill(toBigNumber('0'));
-let res = new Array(100).fill(toBigNumber('0'));
+let res = {};
 let root = {};
 let commitments = {};
 let valuesRevealed = {};
 let treeData = {};
 let votes = {};
+const voteWeights = {};
 
 /* ///////////////////////////////////////////////////////////////
                           COMMIT
@@ -54,11 +55,34 @@ let votes = {};
 /// but in a isCollectionAlloted, input array
 /// you have to pass [2,1,1], here seq and repetation should be maintained
 
-const commit = async (signer, deviation, voteManager, collectionManager, secret) => {
+const commit = async (signer, deviation, voteManager, collectionManager, secret, blockManager) => {
   const numActiveCollections = await collectionManager.getNumActiveCollections();
-  const salt = await voteManager.getSalt();
+  const epoch = await getEpoch();
+  const numProposedBlocks = await blockManager.getNumProposedBlocks(epoch - 1);
   const toAssign = await voteManager.toAssign();
-  // const secret = '0x727d5c9e6d18ed15ce7ac8d3cce6ec8a0e9c02481415c0823ea49d847ccb9ddd';
+  const blockIndexToBeConfirmed = await blockManager.blockIndexToBeConfirmed();
+  let salt;
+  // if =>  If no blocks were proposed last Epoch then fetch the stored salt as new salt
+  // won't be calculated in this case as confirmBlock won't be called both in prev epoch and in this epoch's commit
+
+  // else if => // If blocks were proposed last Epoch and all the blocks got disputed then fetch the stored salt as new salt
+  // won't be calculated in this case as confirmBlock won't be called both in prev epoch and in this epoch's commit
+
+  // else =>   // If blocks are proposed last epoch and any one or more blocks are valid then calculate the new salt
+
+  if (numProposedBlocks === 0) {
+    salt = await voteManager.getSalt();
+  } else if (numProposedBlocks > 0 && blockIndexToBeConfirmed < 0) {
+    salt = await voteManager.getSalt();
+  } else {
+    const blockId = await blockManager.sortedProposedBlockIds(epoch - 1, 0);
+    const block = await blockManager.getProposedBlock(epoch - 1, blockId);
+    const mediansLastEpoch = block.medians;
+    salt = utils.solidityKeccak256(
+      ['uint32', 'uint32[]'],
+      [epoch - 1, mediansLastEpoch]
+    );
+  }
   const seed1 = utils.solidityKeccak256(
     ['bytes32', 'bytes32'],
     [salt, secret]
@@ -115,7 +139,7 @@ const reveal = async (signer, deviation, voteManager, stakeManager) => {
   const values = [];
   for (let j = 0; j < store[signer.address].seqAllotedCollections.length; j++) {
     values.push({
-      medianIndex: store[signer.address].seqAllotedCollections[j],
+      leafId: store[signer.address].seqAllotedCollections[j],
       value: (Number(store[signer.address].seqAllotedCollections[j]) + 1) * 100 + deviation,
       // this +1 is done only for maint vote value as 100 for 0, 200 for 1,
       // its not related to any concept, ofc 0 cant be valid vote result so we couldnr have 0 value for 0
@@ -130,6 +154,7 @@ const reveal = async (signer, deviation, voteManager, stakeManager) => {
     root: store[signer.address].tree[0][0],
   };
   treeData[signer.address] = treeRevealData;
+  // console.log('reveal', signer.address, treeRevealData.values);
   await voteManager.connect(signer).reveal(getEpoch(), treeRevealData, store[signer.address].secret);
   // console.log(treeRevealData);
   const helper = {};
@@ -137,13 +162,22 @@ const reveal = async (signer, deviation, voteManager, stakeManager) => {
   for (let i = 0; i < store[signer.address].seqAllotedCollections.length; i++) {
     const stakerId = await stakeManager.stakerIds(signer.address);
     const influence = await voteManager.getInfluenceSnapshot(getEpoch(), stakerId);
-    const medianIndex = (store[signer.address].seqAllotedCollections)[i];
+    const leafId = (store[signer.address].seqAllotedCollections)[i];
     const voteValue = values[i].value;
     arr.push(voteValue);
-    if (!(helper[medianIndex])) {
-      influenceSum[medianIndex] = (influenceSum[medianIndex]).add(influence);
-      res[medianIndex] = (res[medianIndex]).add(influence.mul(voteValue));
-      helper[medianIndex] = true;
+    if (!(helper[leafId])) {
+      let flag = false;
+      influenceSum[leafId] = (influenceSum[leafId]).add(influence);
+      if (res[leafId] === undefined) res[leafId] = [];
+      for (let j = 0; j < res[leafId].length; j++) {
+        if (res[leafId][j] === voteValue) {
+          flag = true;
+        }
+      }
+      if (!flag) res[leafId].push(voteValue);
+      if (voteWeights[voteValue] === undefined) voteWeights[voteValue] = toBigNumber(0);
+      voteWeights[voteValue] = voteWeights[voteValue].add(influence);
+      helper[leafId] = true;
     }
   }
   votes[signer.address] = arr;
@@ -161,58 +195,97 @@ const reveal = async (signer, deviation, voteManager, stakeManager) => {
 
 // Steps
 // Index reveal events of stakers
-// Find medain on basis of revealed value and influence
-// For non revealed active collection of this epoch, use previous epoch vote value.
+// Find median on basis of revealed value and influence
 // Find iteration using salt as seed
 
-const propose = async (signer, stakeManager, blockManager, voteManager, collectionManager) => {
+const proposeWithDeviation = async (signer, deviation, stakeManager, blockManager, voteManager, collectionManager) => {
   const stakerID = await stakeManager.getStakerId(signer.address);
   const staker = await stakeManager.getStaker(stakerID);
   const { biggestStake, biggestStakerId } = await getBiggestStakeAndId(stakeManager, voteManager); (stakeManager);
   const iteration = await getIteration(voteManager, stakeManager, staker, biggestStake);
-  // console.log('Propose', iteration, biggestStakerId, stakerID);
-  const numActiveCollections = await collectionManager.getNumActiveCollections();
-  // const numActiveCollections = 9;
-  const medians = new Array(numActiveCollections).fill(0);
-  const ids = await collectionManager.getActiveCollections();
-  let temp;
+  const activeCollectionIds = await collectionManager.getActiveCollections();
   const epoch = await getEpoch();
-  const block = await blockManager.getBlock(epoch - 1);
-  for (let j = 0; j < ids.length; j++) {
+  const idsRevealedThisEpoch = [];
+  const mediansValues = [];
+
+  for (let j = 0; j < activeCollectionIds.length; j++) {
     if (Number(influenceSum[j]) !== 0) {
-      temp = (res[j]).div(influenceSum[j]);
-      medians[j] = temp;
-    } else if (block.medians.length !== 0) {
-      const oldIndex = await collectionManager.getIdToIndexRegistryValue(ids[j]);
-      const oldMedian = (await blockManager.getBlock(epoch - 1)).medians[oldIndex];
-      medians[oldIndex] = oldMedian;
+      idsRevealedThisEpoch.push(activeCollectionIds[j]);
+      let accWeight = toBigNumber(0);
+      res[j].sort();
+      for (let i = 0; i < res[j].length; i++) {
+        accWeight = accWeight.add(voteWeights[res[j][i]]);
+        if (accWeight.gt((influenceSum[j].div(2)))) {
+          mediansValues.push(res[j][i] + deviation);
+          break;
+        }
+      }
     }
   }
+  // console.log('propose', idsRevealedThisEpoch, mediansValues);
   await blockManager.connect(signer).propose(epoch,
-    ids,
-    medians,
+    idsRevealedThisEpoch,
+    mediansValues,
     iteration,
     biggestStakerId);
 };
 
-const calculateMedians = async (collectionManager) => {
-  const numActiveCollections = await collectionManager.getNumActiveCollections();
-  const medians = [];
-  let helper;
-  for (let i = 0; i < numActiveCollections; i++) medians.push(0);
-  for (let j = 0; j < numActiveCollections; j++) {
-    if (Number(influenceSum[j]) !== 0) {
-      helper = (res[j]).div(influenceSum[j]);
-      medians[j] = helper;
-    }
-  }
-  return (medians);
+const propose = async (signer, stakeManager, blockManager, voteManager, collectionManager) => {
+  await proposeWithDeviation(signer, 0, stakeManager, blockManager, voteManager, collectionManager);
 };
 
+const calculateMedians = async (collectionManager) => {
+  const numActiveCollections = await collectionManager.getNumActiveCollections();
+
+  // const idsRevealedThisEpoch = [];
+  const mediansValues = [];
+
+  for (let j = 0; j < numActiveCollections; j++) {
+    if (Number(influenceSum[j]) !== 0) {
+      let accWeight = toBigNumber(0);
+      res[j].sort();
+      for (let i = 0; i < res[j].length; i++) {
+        accWeight = accWeight.add(voteWeights[res[j][i]]);
+        if (accWeight.gt((influenceSum[j].div(2)))) {
+          mediansValues.push(res[j][i]);
+          break;
+        }
+      }
+    }
+  }
+  return (mediansValues);
+};
+
+const calculateInvalidMedians = async (collectionManager, deviation) => {
+  const numActiveCollections = await collectionManager.getNumActiveCollections();
+
+  // const idsRevealedThisEpoch = [];
+  const mediansValues = [];
+  let validLeafIdToBeDisputed = 0;
+  for (let j = 0; j < numActiveCollections; j++) {
+    if (Number(influenceSum[j]) !== 0) {
+      let accWeight = toBigNumber(0);
+      res[j].sort();
+      for (let i = 0; i < res[j].length; i++) {
+        accWeight = accWeight.add(voteWeights[res[j][i]]);
+        if (accWeight.gt((influenceSum[j].div(2)))) {
+          if (validLeafIdToBeDisputed === 0) {
+            validLeafIdToBeDisputed = j;
+            mediansValues.push(res[j][i] + deviation);
+          } else {
+            mediansValues.push(res[j][i]);
+          }
+          break;
+        }
+      }
+    }
+  }
+  return [mediansValues, validLeafIdToBeDisputed];
+};
 const reset = async () => {
   store = {};
   influenceSum = new Array(100).fill(toBigNumber('0'));
-  res = new Array(100).fill(toBigNumber('0'));
+  res = {};
   root = {};
   commitments = {};
   valuesRevealed = {};
@@ -241,6 +314,7 @@ module.exports = {
   commit,
   reveal,
   propose,
+  proposeWithDeviation,
   reset,
   getAnyAssignedIndex,
   getRoot,
@@ -250,4 +324,5 @@ module.exports = {
   getTreeRevealData,
   getValuesArrayRevealed,
   calculateMedians,
+  calculateInvalidMedians,
 };

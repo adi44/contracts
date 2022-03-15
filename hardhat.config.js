@@ -14,6 +14,7 @@ require('solidity-coverage');
 require('hardhat-abi-exporter');
 require('@tenderly/hardhat-tenderly');
 require('@nomiclabs/hardhat-etherscan');
+require('@primitivefi/hardhat-dodoc');
 
 const {
   PROVIDER_HOST,
@@ -53,7 +54,7 @@ module.exports = {
         settings: {
           optimizer: {
             enabled: true,
-            runs: 2000,
+            runs: 200,
           },
         },
       },
@@ -95,5 +96,8 @@ module.exports = {
   },
   mocha: {
     timeout: 50000,
+  },
+  dodoc: {
+    runOnCompile: false,
   },
 };

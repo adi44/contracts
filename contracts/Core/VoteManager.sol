@@ -12,15 +12,40 @@ import "./StateManager.sol";
 import "../Initializable.sol";
 import "../lib/MerklePosAware.sol";
 
+/** @title VoteManager
+ * @notice VoteManager manages the commitments of votes of the stakers
+ */
+
 contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerParams, IVoteManager {
     IStakeManager public stakeManager;
     IRewardManager public rewardManager;
     IBlockManager public blockManager;
     ICollectionManager public collectionManager;
 
+    /**
+     * @dev Emitted when a staker commits
+     * @param epoch epoch when the commitment was sent
+     * @param stakerId id of the staker that committed
+     * @param commitment the staker's commitment
+     * @param timestamp time when the commitment was set for the staker
+     */
     event Committed(uint32 epoch, uint32 stakerId, bytes32 commitment, uint256 timestamp);
-    event Revealed(uint32 epoch, uint32 stakerId, Structs.AssignedAsset[] values, uint256 timestamp);
+    /**
+     * @dev Emitted when a staker reveals
+     * @param epoch epoch when the staker revealed
+     * @param stakerId id of the staker that reveals
+     * @param influence influence of the staker
+     * @param values of the collections assigned to the staker
+     * @param timestamp time when the staker revealed
+     */
+    event Revealed(uint32 epoch, uint32 stakerId, uint256 influence, Structs.AssignedAsset[] values, uint256 timestamp);
 
+    /**
+     * @param stakeManagerAddress The address of the StakeManager contract
+     * @param rewardManagerAddress The address of the RewardManager contract
+     * @param blockManagerAddress The address of the BlockManager contract
+     * @param collectionManagerAddress The address of the CollectionManager contract
+     */
     function initialize(
         address stakeManagerAddress,
         address rewardManagerAddress,
@@ -33,6 +58,25 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
         collectionManager = ICollectionManager(collectionManagerAddress);
     }
 
+    /**
+     * @notice stakers query the jobs in collection, aggregate and instead of revealing them instantly,
+     * they need to submit a hash of their results which becomes their commitment and send it to the protocol
+     * @dev After query and aggregation is done, the staker would have to construct a merkle tree of their votes.
+     *
+     * The commitment sent by the staker is hash of root of the merkle tree and seed, which
+     * is the hash of the salt and the staker's secret.
+     *
+     * Collection allocation of each staker is done using seed and the staker would know in commit itself their allocations
+     * but wouldn't know other staker's allocation unless they have their seed. Hence, it is advisable to fetch results for
+     * only those collections that they have been assigned and set rest to 0 and construct a merkle tree accordingly
+     *
+     * Before the staker's commitment is registered, the staker confirms the block of the previous epoch incase the initial
+     * proposer had not confirmed the block. The staker then gets the block reward if confirmed by the staker and is then
+     * given out penalties based on their votes in the previous epoch or incase of inactivity.
+     *
+     * @param epoch epoch when the commitment was sent
+     * @param commitment the commitment
+     */
     function commit(uint32 epoch, bytes32 commitment) external initialized checkEpochAndState(State.Commit, epoch) {
         require(commitment != 0x0, "Invalid commitment");
         uint32 stakerId = stakeManager.getStakerId(msg.sender);
@@ -56,6 +100,18 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
         }
     }
 
+    /**
+     * @notice staker reveal the votes that they had committed to the protocol in the commit state.
+     * Stakers would only reveal the collections they have been allocated, the rest of their votes wont matter
+     * @dev stakers would need to submit their votes in accordance of how they were assigned to the staker.
+     * for example, if they are assigned the following ids: [2,5,4], they would to send their votes in the following order only
+     * The votes of other ids dont matter but they should not be passed in the values.
+     * So staker would have to pass the proof path of the assigned values of the merkle tree, root of the merkle tree and
+     * the values being revealed into a struct in the Structs.MerkleTree format.
+     * @param epoch epoch when the revealed their votes
+     * @param tree the merkle tree struct of the staker
+     * @param secret staker's secret using which seed would be calculated and thereby checking for collection allocation
+     */
     function reveal(
         uint32 epoch,
         Structs.MerkleTree memory tree,
@@ -79,13 +135,13 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
 
         uint256 influence = stakeManager.getInfluence(stakerId);
         influenceSnapshot[epoch][stakerId] = influence;
-
+        uint16 max = collectionManager.getNumActiveCollections();
         for (uint16 i = 0; i < tree.values.length; i++) {
-            require(_isAssetAllotedToStaker(seed, i, tree.values[i].medianIndex), "Revealed asset not alloted");
+            require(_isAssetAllotedToStaker(seed, i, max, tree.values[i].leafId), "Revealed asset not alloted");
             // If Job Not Revealed before, like its not in same reveal batch of this
             // As it would be redundant to check
             // please note due to this job result cant be zero
-            if (votes[epoch][stakerId][tree.values[i].medianIndex] == 0) {
+            if (votes[epoch][stakerId][tree.values[i].leafId] == 0) {
                 // Check if asset value is zero
                 // Reason for doing this is, staker can vote 0 for assigned coll, and get away with penalties"
                 require(tree.values[i].value != 0, "0 vote for assigned coll");
@@ -96,7 +152,7 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
                         tree.proofs[i],
                         tree.root,
                         keccak256(abi.encode(tree.values[i].value)),
-                        tree.values[i].medianIndex,
+                        tree.values[i].leafId,
                         depth,
                         collectionManager.getNumActiveCollections()
                     ),
@@ -104,22 +160,30 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
                 );
                 // TODO : Possible opt
                 /// Can we remove epochs ? would save lot of gas
-                votes[epoch][stakerId][tree.values[i].medianIndex] = tree.values[i].value;
-                voteWeights[epoch][tree.values[i].medianIndex][tree.values[i].value] =
-                    voteWeights[epoch][tree.values[i].medianIndex][tree.values[i].value] +
+                votes[epoch][stakerId][tree.values[i].leafId] = tree.values[i].value;
+                voteWeights[epoch][tree.values[i].leafId][tree.values[i].value] =
+                    voteWeights[epoch][tree.values[i].leafId][tree.values[i].value] +
                     influence;
-                totalInfluenceRevealed[epoch][tree.values[i].medianIndex] =
-                    totalInfluenceRevealed[epoch][tree.values[i].medianIndex] +
-                    influence;
+                totalInfluenceRevealed[epoch][tree.values[i].leafId] = totalInfluenceRevealed[epoch][tree.values[i].leafId] + influence;
             }
         }
 
         epochLastRevealed[stakerId] = epoch;
 
-        emit Revealed(epoch, stakerId, tree.values, block.timestamp);
+        emit Revealed(epoch, stakerId, influence, tree.values, block.timestamp);
     }
 
-    //bounty hunter revealing secret in commit st ate
+    //bounty hunter revealing secret in commit state
+    /**
+     * @notice incase the staker's secret and root of the merkle tree is leaked before the staker reveals,
+     * a bounty hunter can snitch on the staker and reveal the root and secret to the protocol
+     * @dev when the staker is correctly snitched, their stake is slashed and the bounty hunter receives
+     * a part of their stake based on the Slash Nums parameters. A staker can be snitched only in the commit state
+     * @param epoch epoch when the bounty hunter snitched.
+     * @param root of the staker's merkle tree
+     * @param secret secret of the staker being snitched
+     * @param stakerAddress the address of the staker
+     */
     function snitch(
         uint32 epoch,
         bytes32 root,
@@ -140,10 +204,12 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
         stakeManager.slash(epoch, thisStakerId, msg.sender);
     }
 
+    /// @inheritdoc IVoteManager
     function storeSalt(bytes32 _salt) external override onlyRole(SALT_MODIFIER_ROLE) {
         salt = _salt;
     }
 
+    /// @inheritdoc IVoteManager
     function storeDepth(uint256 _depth) external override onlyRole(DEPTH_MODIFIER_ROLE) {
         depth = _depth;
     }
@@ -153,62 +219,80 @@ contract VoteManager is Initializable, VoteStorage, StateManager, VoteManagerPar
         return (commitments[stakerId]);
     }
 
+    /// @inheritdoc IVoteManager
     function getVoteValue(
         uint32 epoch,
         uint32 stakerId,
-        uint16 medianIndex
+        uint16 leafId
     ) external view override returns (uint32) {
         //epoch -> stakerid -> asserId
-        return votes[epoch][stakerId][medianIndex];
+        return votes[epoch][stakerId][leafId];
     }
 
+    /// @inheritdoc IVoteManager
     function getVoteWeight(
         uint32 epoch,
-        uint16 medianIndex,
+        uint16 leafId,
         uint32 voteValue
     ) external view override returns (uint256) {
-        //epoch -> medianIndex -> voteValue -> weight
-        return (voteWeights[epoch][medianIndex][voteValue]);
+        //epoch -> leafId -> voteValue -> weight
+        return (voteWeights[epoch][leafId][voteValue]);
     }
 
+    /// @inheritdoc IVoteManager
     function getInfluenceSnapshot(uint32 epoch, uint32 stakerId) external view override returns (uint256) {
         //epoch -> stakerId
         return (influenceSnapshot[epoch][stakerId]);
     }
 
+    /// @inheritdoc IVoteManager
     function getStakeSnapshot(uint32 epoch, uint32 stakerId) external view override returns (uint256) {
         //epoch -> stakerId
         return (stakeSnapshot[epoch][stakerId]);
     }
 
-    function getTotalInfluenceRevealed(uint32 epoch, uint16 medianIndex) external view override returns (uint256) {
-        // epoch -> asseted
-        return (totalInfluenceRevealed[epoch][medianIndex]);
+    /// @inheritdoc IVoteManager
+    function getTotalInfluenceRevealed(uint32 epoch, uint16 leafId) external view override returns (uint256) {
+        return (totalInfluenceRevealed[epoch][leafId]);
     }
 
+    /// @inheritdoc IVoteManager
     function getEpochLastCommitted(uint32 stakerId) external view override returns (uint32) {
         return commitments[stakerId].epoch;
     }
 
+    /// @inheritdoc IVoteManager
     function getEpochLastRevealed(uint32 stakerId) external view override returns (uint32) {
         return epochLastRevealed[stakerId];
     }
 
+    /// @inheritdoc IVoteManager
     function getSalt() external view override returns (bytes32) {
         return salt;
     }
 
+    /**
+     * @dev an internal function used to check whether the particular collection was allocated to the staker
+     * @param seed hash of salt and staker's secret
+     * @param iterationOfLoop positioning of the collection allocation sequence
+     * @param leafId leafId of the collection that is being checked for allotment
+     */
     function _isAssetAllotedToStaker(
         bytes32 seed,
         uint16 iterationOfLoop,
-        uint16 medianIndex
+        uint16 max,
+        uint16 leafId
     ) internal view initialized returns (bool) {
         // max= numAssets, prng_seed = seed+ iteration of for loop
-        uint16 max = collectionManager.getNumActiveCollections();
-        if (_prng(keccak256(abi.encode(seed, iterationOfLoop)), max) == medianIndex) return true;
+        if (_prng(keccak256(abi.encode(seed, iterationOfLoop)), max) == leafId) return true;
         return false;
     }
 
+    /**
+     * @dev an internal function used by _isAssetAllotedToStaker to check for allocation
+     * @param prngSeed hash of seed and exact position in sequence
+     * @param max total number of active collections
+     */
     function _prng(bytes32 prngSeed, uint256 max) internal pure returns (uint256) {
         uint256 sum = uint256(prngSeed);
         return (sum % max);
